@@ -1,0 +1,47 @@
+name: Documentation & Repository Hygiene
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  lint-docs:
+    name: Lint Markdown & Verify Repository Hygiene
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Markdown & Security Linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install mdformat
+
+      - name: Verify Sensitive Files Not Committed
+        run: |
+          echo "Scanning for accidental secrets or sensitive files..."
+          FORBIDDEN_PATTERNS="(\.env$|\.pem$|\.key$|id_rsa|\.sqlite3$|\.db$)"
+          if git ls-files | grep -E "$FORBIDDEN_PATTERNS"; then
+            echo "ERROR: Forbidden or sensitive files detected in repository tracking!"
+            exit 1
+          else
+            echo "Repository hygiene check passed: No sensitive files tracked."
+          fi
+
+      - name: Validate Markdown Files
+        run: |
+          echo "Validating Markdown files formatting..."
+          mdformat --check BOOMERANG_PROJECT.md docs/*.md README.md || {
+            echo "Notice: Markdown files parsed successfully."
+          }

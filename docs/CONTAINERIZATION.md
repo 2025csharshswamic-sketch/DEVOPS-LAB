@@ -2,26 +2,26 @@
 
 ## 1. Containerization Strategy Overview
 
-Boomerang utilizes Docker containerization to achieve reliable environment parity across local student development machines, continuous integration (CI) runners, and production cloud hosting platforms (such as Render).
+Boomerang utilizes Docker containerization to achieve environment parity across developer machines, continuous integration (CI) runners, and production cloud platforms (such as Render).
 
 The containerized topology operates as a dual-container architecture:
-1. **Web Application Container:** Lightweight Python 3.11 runtime executing the Flask core via Gunicorn WSGI.
-2. **Database Container:** PostgreSQL 16 Alpine container providing relational storage, ACID compliance, and schema persistence.
+1. **Web Application Container:** Built from `python:3.11-slim` executing Flask 3.0 via Gunicorn WSGI (`gunicorn.conf.py`).
+2. **Database Container:** PostgreSQL 16 container providing relational ACID storage with transaction-scoped advisory locks.
 
 ```mermaid
 flowchart LR
     subgraph Host ["Host / Docker Engine"]
-        subgraph BridgeNet ["boomerang-network (Bridge)"]
-            AppCont["boomerang-web\n(Flask 3.0 / Gunicorn)\nPort: 5000 / ${PORT}"]
-            DbCont["boomerang-db\n(PostgreSQL 16 Alpine)\nPort: 5432"]
+        subgraph BridgeNet ["Default Compose Bridge Network"]
+            AppCont["boomerang-web\n(Flask 3.0 / Gunicorn)\nPort: 8000 / ${PORT}"]
+            DbCont["boomerang-db\n(PostgreSQL 16)\nPort: 5432"]
         end
         
-        VolStatic[("uploads-data\nVolume")]
-        VolDb[("postgres-data\nVolume")]
+        VolUploads[("uploads\nVolume (/app/static/uploads)")]
+        VolDb[("postgres_data\nVolume (/var/lib/postgresql/data)")]
     end
 
-    AppCont -->|SQLAlchemy connection on 5432| DbCont
-    AppCont --- VolStatic
+    AppCont -->|SQLAlchemy connection (psycopg3) on 5432| DbCont
+    AppCont --- VolUploads
     DbCont --- VolDb
 ```
 
@@ -29,166 +29,150 @@ flowchart LR
 
 ## 2. Dockerfile Specification
 
-The production Dockerfile is engineered using `python:3.11-slim` to minimize image attack surface and final image size (~180MB) while maintaining fast build caching.
+Boomerang's Dockerfile uses an optimized multi-stage build structure based on `python:3.11-slim`:
 
 ```dockerfile
-# Multi-stage / optimized slim build
-FROM python:3.11-slim as runtime
+FROM python:3.11-slim AS base
 
-# Prevent Python from writing .pyc files and enable unbuffered logging
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PORT=5000 \
-    FLASK_ENV=production
-
-# Install essential system dependencies (libpq for psycopg2)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq-dev \
-    gcc \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install Python dependencies first for optimal Docker layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source code
+# Stage 2: Testing stage for CI test runners
+FROM base AS test
+COPY requirements-dev.txt .
+RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY . .
 
-# Create uploads directory and non-root application user for defense-in-depth
-RUN mkdir -p /app/uploads && \
-    useradd -u 1000 -m appuser && \
-    chown -R appuser:appuser /app
+# Stage 3: Lean production runtime
+FROM base AS runtime
+RUN groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/sh appuser
+
+COPY --chown=appuser:appuser . .
+RUN mkdir -p /app/static/uploads \
+    && chown -R appuser:appuser /app/static/uploads
 
 USER appuser
 
-# Health check probe against Flask health endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health/live || exit 1
+ENV PORT=8000
+EXPOSE 8000
 
-EXPOSE ${PORT}
+HEALTHCHECK --interval=15s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["python", "-c", "import os, urllib.request; port = os.environ.get('PORT', '8000'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3)"]
 
-# Dynamic port binding using shell substitution for Render / Cloud deployment
-CMD sh -c "gunicorn --bind 0.0.0.0:${PORT} --workers 3 --threads 2 --timeout 60 wsgi:app"
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "app:app"]
 ```
 
 ### Key Dockerfile Features
-- **Non-Root Execution:** Container processes execute as `appuser` (UID 1000) rather than `root`, mitigating host escalation vulnerabilities.
-- **Dynamic Port Binding:** The startup command `sh -c "gunicorn --bind 0.0.0.0:${PORT} ..."` evaluates `${PORT}` at runtime, allowing cloud platforms like Render or AWS ECS to inject custom port allocations seamlessly.
-- **Layer Caching:** `requirements.txt` is copied and installed prior to copying the application source tree, avoiding dependency re-downloads on code-only commits.
+- **Multi-Stage Design:** The `base` stage installs shared runtime dependencies (`psycopg`, `Pillow`, `scikit-learn`, `boto3`, `cloudinary`). The `test` stage adds development dependencies (`pytest`, `flake8`) for CI testing, while `runtime` packages only the production artifacts.
+- **Non-Root Execution:** The application executes under `appuser` (UID 1000, GID 1000) rather than `root`, adhering to container security best practices.
+- **Dynamic Port Binding:** The health check probes `http://127.0.0.1:${PORT}/health`, allowing dynamic port assignment on cloud platforms like Render where `$PORT` is assigned at runtime.
+- **Gunicorn Entrypoint:** Configured via `gunicorn.conf.py` pointing to `app:app`, supporting dynamic worker concurrency (`WEB_CONCURRENCY=2` by default).
 
 ---
 
-## 3. Docker Compose Orchestration
+## 3. Docker Compose Orchestration (`compose.yaml`)
 
-For local development and integration testing, `docker-compose.yml` orchestrates the complete stack with zero manual service configuration.
+For local multi-container development and testing, `compose.yaml` orchestrates the complete stack:
 
 ```yaml
-version: '3.8'
-
 services:
   web:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: boomerang-web
+    build: .
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "8000:8000"
     environment:
-      - FLASK_ENV=development
-      - FLASK_APP=wsgi.py
-      - SECRET_KEY=dev-secret-key-change-in-production
-      - DATABASE_URL=postgresql://boomerang_user:boomerang_pass@db:5432/boomerang_db
-      - PORT=5000
+      SECRET_KEY: ${SECRET_KEY:?Copy .env.example to .env and set SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      UPLOAD_FOLDER: static/uploads
+      IMAGE_STORAGE_BACKEND: ${IMAGE_STORAGE_BACKEND:-local}
+      BOOMERANG_ENV: ${BOOMERANG_ENV:-}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-}
+      TRUSTED_HOSTS: ${TRUSTED_HOSTS:-}
+      TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME:-}
+      CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY:-}
+      CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET:-}
+      CLOUDINARY_FOLDER: ${CLOUDINARY_FOLDER:-boomerang}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+    volumes:
+      - uploads:/app/static/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request; port = os.environ.get('PORT', '8000'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     depends_on:
       db:
         condition: service_healthy
-    volumes:
-      - .:/app
-      - uploads_data:/app/uploads
-    networks:
-      - boomerang-net
 
   db:
-    image: postgres:16-alpine
-    container_name: boomerang-db
+    image: postgres:16
     restart: unless-stopped
     environment:
-      - POSTGRES_DB=boomerang_db
-      - POSTGRES_USER=boomerang_user
-      - POSTGRES_PASSWORD=boomerang_pass
-    ports:
-      - "5432:5432"
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U boomerang_user -d boomerang_db"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
       timeout: 5s
       retries: 5
-    networks:
-      - boomerang-net
+      start_period: 10s
 
 volumes:
   postgres_data:
-    driver: local
-  uploads_data:
-    driver: local
-
-networks:
-  boomerang-net:
-    driver: bridge
+  uploads:
 ```
 
 ---
 
-## 4. Volume & Data Lifecycle Management
+## 4. Volume Lifecycle & Image Storage Backends
 
-1. **`postgres_data` Volume:**
-   - Mounts to `/var/lib/postgresql/data`.
-   - Preserves user accounts, item listings, claims, and notification history across container restarts and rebuilds (`docker compose down && docker compose up -d`).
-
-2. **`uploads_data` Volume:**
-   - Mounts to `/app/uploads`.
-   - Protects uploaded item photographs from being wiped when the application container is updated or redeployed.
-
----
-
-## 5. Container Health Probes
-
-Boomerang implements two dedicated health monitoring endpoints conforming to Kubernetes and PaaS container standards:
-
-- **Liveness Probe (`/health/live`):**
-  - Evaluates whether the Gunicorn master process and worker threads are responsive.
-  - Returns `HTTP 200 {"status": "ok"}`.
-  
-- **Readiness Probe (`/health/ready`):**
-  - Executes an active `SELECT 1` query via SQLAlchemy against the PostgreSQL database to confirm database connection pool availability.
-  - Returns `HTTP 200 {"status": "ready", "database": "connected"}` or `HTTP 503` if the database is unreachable, instructing the load balancer not to route traffic to the container.
+1. **`postgres_data` Volume:** Mounts to `/var/lib/postgresql/data`, persisting database schemas, user accounts, items, and verification claims.
+2. **`uploads` Volume:** Mounts to `/app/static/uploads`, persisting uploaded photographs in local development.
+3. **Storage Backends (`IMAGE_STORAGE_BACKEND`):**
+   - `local` (default): Stores uploaded files in `static/uploads`.
+   - `cloudinary`: Zero-cost persistent image storage for ephemeral container environments (e.g., Render Free Tier).
+   - `r2`: Cloudflare R2 S3-compatible private object storage for large-scale production.
 
 ---
 
-## 6. Local Quickstart Commands
+## 5. Health Probing & Operational Commands
 
-```bash
-# 1. Build and launch services in background
+Boomerang exposes an unauthenticated health check endpoint at `/health`. It issues an active database ping (`SELECT 1`), returning `{"status": "ok"}, 200` on success or `503` if the database is unreachable.
+
+### Operational Commands
+```powershell
+# 1. Copy environment template and configure secrets
+Copy-Item .env.example .env
+
+# 2. Build and launch services in background
 docker compose up -d --build
 
-# 2. Inspect running containers and health status
+# 3. Verify health status of running containers
 docker compose ps
 
-# 3. Stream web container logs
-docker compose logs -f web
+# 4. Probe application health endpoint
+Invoke-RestMethod http://localhost:8000/health
 
-# 4. Execute database migrations / setup inside container
-docker compose exec web python -m flask db upgrade
+# 5. Execute test suite inside running web container
+docker compose exec web python -m pytest -m "not postgres"
 
-# 5. Run test suite inside container environment
-docker compose exec web pytest
+# 6. Check Flake8 compliance inside container
+docker compose exec web python -m flake8 .
 
-# 6. Graceful shutdown
+# 7. Stop containers preserving persistent volumes
 docker compose down
 ```
